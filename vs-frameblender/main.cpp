@@ -166,19 +166,6 @@ static void VS_CC frameBlendCreate(const VSMap* in, VSMap* out, void* userData, 
         for (int i = 0; i < numWeights; i++)
             d->weightPercents.push_back(vsapi->propGetFloat(in, "weights", i, 0) / totalWeights);
 
-        // logging
-        std::string weightStr;
-        for (auto& weight : d->weightPercents) {
-            if (weightStr != "")
-                weightStr += ", ";
-
-            weightStr += std::to_string(weight);
-        }
-
-        vsapi->propGetInt(in, "log", 0, &err);
-        if (!err) {
-            vsapi->logMessage(mtDebug, ("Frame blending with weights [" + weightStr + "]").c_str());
-        }
 
         getPlanesArg(in, d->process, vsapi);
     }
@@ -193,5 +180,5 @@ static void VS_CC frameBlendCreate(const VSMap* in, VSMap* out, void* userData, 
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin* plugin) {
     configFunc("com.vapoursynth.frameblender", "frameblender", "Frame blender", VAPOURSYNTH_API_VERSION, 1, plugin);
-    registerFunc("FrameBlend", "clip:clip;weights:float[];log:int:opt;", frameBlendCreate, 0, plugin);
+    registerFunc("FrameBlend", "clip:clip;weights:float[];", frameBlendCreate, 0, plugin);
 }
