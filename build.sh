@@ -1,2 +1,2 @@
-#!/bin/bash
-clang++ ./vs-frameblender/main.cpp -shared -std=c++17 -I./vs-frameblender/vapoursynth -o foo.so
+clang++ ./src/blender.cpp -O3 -march=native -shared -std=c++17 -I./vapoursynth -o blender.so
+sudo mv blender.so /usr/lib/vapoursynth

@@ -1,3 +1,2 @@
 @echo off
-cd /d "%~dp0"
-g++ .\vs-frameblender\main.cpp -shared -std=c++17 -I.\vs-frameblender\vapoursynth -o foo.dll
+clang++ .\src\blender.cpp -O3 -march=native -shared -std=c++17 -I.\vapoursynth -o blender.dll
