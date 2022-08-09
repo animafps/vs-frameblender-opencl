@@ -170,9 +170,7 @@ static void VS_CC frameBlendCreate(const VSMap *in, VSMap *out, void *userData, 
         int plane = vsapi->mapGetInt(in, "planes", i, &err);
 
         if (err) {
-            char msg[256];
-            sprintf(msg, "plane %d is not a valid plane: %s", i, vsapi->mapGetError(out));
-            vsapi->mapSetError(out, msg);
+            vsapi->mapSetError(out, "FrameBlend: failed to load plane arg");
             frameBlendFree(&d, core, vsapi);
             return;
         }
