@@ -127,27 +127,27 @@ static void VS_CC frameBlendFree(void *instanceData, VSCore *core, const VSAPI *
 
 static void VS_CC frameBlendCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
 
-    FrameBlendData d;
-    FrameBlendData *data;
+    FrameBlendData data;
+    FrameBlendData *out_data;
 
-    int numWeights = vsapi->mapNumElements(in, "weights");
     int err;
-    
-    if ((numWeights % 2) != 1) {
-        vsapi->mapSetError(out, "Number of weights must be odd");
-        frameBlendFree(&d, core, vsapi);
-        return;
-    }
 
     // get clip and clip video info
-    d.node = vsapi->mapGetNode(in, "clip", 0, &err);
+    data.node = vsapi->mapGetNode(in, "clip", 0, &err);
     if (err) {
-        vsapi->mapSetError(out, "clip is not a valid VideoNode");
-        frameBlendFree(&d, core, vsapi);
+        vsapi->mapSetError(out, "FrameBlend: clip is not a valid VideoNode");
+        vsapi->freeNode(data.node);
         return;
     }
 
-    d.vi = vsapi->getVideoInfo(d.node);
+    int numWeights = vsapi->mapNumElements(in, "weights");
+    if ((numWeights % 2) != 1) {
+        vsapi->mapSetError(out, "Number of weights must be odd");
+        vsapi->freeNode(data.node);
+        return;
+    }
+
+    data.vi = vsapi->getVideoInfo(data.node);
 
     // get weights
     float totalWeights = 0.f;
@@ -156,51 +156,37 @@ static void VS_CC frameBlendCreate(const VSMap *in, VSMap *out, void *userData, 
 
     // scale weights
     for (int i = 0; i < numWeights; i++) {
-        d.weightPercents.push_back(vsapi->mapGetFloat(in, "weights", i, 0) / totalWeights);
+        data.weightPercents.push_back(vsapi->mapGetFloat(in, "weights", i, 0) / totalWeights);
     }
 
     int nPlanes = vsapi->mapNumElements(in, "planes");
 
     for (int i = 0; i < 3; i++)
-        d.process[i] = (nPlanes <= 0); // default to all planes if no planes specified
+        data.process[i] = (nPlanes <= 0); // default to all planes if no planes specified
 
     if (nPlanes <= 0) nPlanes = 3;
 
     for (int i = 0; i < nPlanes; i++) {
-        int plane = vsapi->mapGetInt(in, "planes", i, &err);
 
-        if (err) {
-            char msg[256];
-            sprintf(msg, "plane %d is not a valid plane: %s", i, vsapi->mapGetError(out));
-            vsapi->mapSetError(out, msg);
-            frameBlendFree(&d, core, vsapi);
-            return;
-        }
+        int plane = vsapi->mapGetInt(in, "planes", i, &err);
 
         if (plane < 0 || plane >= 3) {
             vsapi->mapSetError(out, "FrameBlend: plane index out of range");
-            frameBlendFree(&d, core, vsapi);
+            vsapi->freeNode(data.node);
             return;
         }
 
-        if (d.process[plane]) {
-            vsapi->mapSetError(out, "FrameBlend: plane specified twice");
-            frameBlendFree(&d, core, vsapi);
-            return;
-        }
-
-        d.process[plane] = true;
+        data.process[plane] = true;
     }
 
-    data = (FrameBlendData *) malloc(sizeof(d));
-    *data = d;
+    out_data = new FrameBlendData { data };
 
     VSFilterDependency deps[] = {
-        {d.node, rpGeneral}
+        {data.node, rpGeneral}
     };
 
     vsapi->createVideoFilter(
-        out, "FrameBlend", d.vi, frameBlendGetFrame, frameBlendFree, fmParallelRequests, deps, 1, data, core
+        out, "FrameBlend", data.vi, frameBlendGetFrame, frameBlendFree, fmParallelRequests, deps, 1, out_data, core
     );
 }
 
