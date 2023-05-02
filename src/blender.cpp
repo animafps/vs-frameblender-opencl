@@ -6,54 +6,59 @@
 #include <limits>
 #include <memory>
 #include <vector>
+#include <CL/opencl.hpp>
+#include <iostream>
 #include "../vapoursynth/VSHelper4.h"
 #include "../vapoursynth/VapourSynth4.h"
-
 
 typedef struct {
         VSNode *node;
         const VSVideoInfo *vi;
         std::vector<float> weightPercents;
+        cl::Context context;
+        cl::Program::Sources sources;
+        cl::Program program;
+        cl::Device device;
         bool process[3];
 } FrameBlendData;
 
 
-template<typename T>
 static void
 frameBlend(const FrameBlendData *d, const VSFrame * const *srcs, VSFrame *dst, int plane, const VSAPI *vsapi) {
-    int stride = vsapi->getStride(dst, plane) / sizeof(T);
+    int stride = vsapi->getStride(dst, plane) / sizeof(uint8_t);
     int width = vsapi->getFrameWidth(dst, plane);
     int height = vsapi->getFrameHeight(dst, plane);
 
-    const T *srcpp[128];
+    const uint8_t *srcpp[128];
     const size_t numSrcs = d->weightPercents.size();
 
     for (size_t i = 0; i < numSrcs; i++) {
-        srcpp[i] = reinterpret_cast<const T *>(vsapi->getReadPtr(srcs[i], plane));
+        srcpp[i] = reinterpret_cast<const uint8_t *>(vsapi->getReadPtr(srcs[i], plane));
     }
+    /// Need to linearize scrpp which is the array of frames 
 
-    T *VS_RESTRICT dstp = reinterpret_cast<T *>(vsapi->getWritePtr(dst, plane));
-
+    uint8_t *VS_RESTRICT dstp = reinterpret_cast<uint8_t *>(vsapi->getWritePtr(dst, plane));
+    const float *weight = d->weightPercents.data();
     unsigned maxVal = (1U << d->vi->format.bitsPerSample) - 1;
+    cl::CommandQueue queue(d->context, d->device);
+    cl::Kernel frame_blend_kernel = cl::Kernel(d->program, "frame_blend_kernel");
 
-    for (int h = 0; h < height; ++h) {
-        for (int w = 0; w < width; ++w) {
-            float acc = 0;
-
-            for (size_t i = 0; i < numSrcs; ++i) {
-                T val = srcpp[i][w];
-                acc += val * d->weightPercents[i];
-            }
-
-            int actualAcc = std::clamp(int(acc), 0, int(maxVal));
-            dstp[w] = static_cast<T>(actualAcc);
-        }
-
-        for (size_t i = 0; i < numSrcs; ++i) {
-            srcpp[i] += stride;
-        }
-        dstp += stride;
-    }
+    cl::Buffer strideBuf(d->context, CL_MEM_READ_ONLY | CL_MEM_HOST_NO_ACCESS | CL_MEM_COPY_HOST_PTR, sizeof(stride), &stride);
+    cl::Buffer widthBuf(d->context, CL_MEM_READ_ONLY | CL_MEM_HOST_NO_ACCESS | CL_MEM_COPY_HOST_PTR, sizeof(width), &width);
+    cl::Buffer heightBuf(d->context, CL_MEM_READ_ONLY | CL_MEM_HOST_NO_ACCESS | CL_MEM_COPY_HOST_PTR, sizeof(height), &height);
+    cl::Buffer destBuf(d->context, CL_MEM_COPY_HOST_PTR, sizeof(uint8_t) * width * height, &dst);
+    cl::Buffer srcppBuf(d->context, CL_MEM_COPY_HOST_PTR, sizeof(uint8_t) * 128 * width * height, &srcpp);
+    cl::Buffer weightpercentsBuf(d->context, CL_MEM_COPY_HOST_PTR, sizeof(float) * numSrcs, &weight);
+    frame_blend_kernel.setArg(0, strideBuf);
+    frame_blend_kernel.setArg(1, widthBuf);
+    frame_blend_kernel.setArg(2,heightBuf);
+    frame_blend_kernel.setArg(3, destBuf);
+    frame_blend_kernel.setArg(4,srcppBuf);
+    frame_blend_kernel.setArg(5, weightpercentsBuf);
+    cl::Event ev1;
+    queue.enqueueNDRangeKernel(frame_blend_kernel, cl::NullRange, cl::NDRange(numSrcs*width*height), cl::NullRange, NULL, &ev1);
+    ev1.wait();
+    queue.enqueueReadBuffer(destBuf, true, 0,sizeof(uint8_t) * width * height, dst);
 }
 
 static const VSFrame *VS_CC frameBlendGetFrame(
@@ -101,9 +106,7 @@ static const VSFrame *VS_CC frameBlendGetFrame(
         for (int plane = 0; plane < fi->numPlanes; plane++) {
             if (d->process[plane]) {
                 if (fi->bytesPerSample == 1) {
-                    frameBlend<uint8_t>(d, frames.data(), dst, plane, vsapi);
-                } else if (fi->bytesPerSample == 2) {
-                    frameBlend<uint16_t>(d, frames.data(), dst, plane, vsapi);
+                    frameBlend(d, frames.data(), dst, plane, vsapi);
                 } else {
                     return nullptr;
                 }
@@ -179,6 +182,60 @@ static void VS_CC frameBlendCreate(const VSMap *in, VSMap *out, void *userData, 
         data.process[plane] = true;
     }
 
+    //get all platforms (drivers)
+    std::vector<cl::Platform> all_platforms;
+    cl::Platform::get(&all_platforms);
+    if(all_platforms.size()==0){
+        std::cout<<" No platforms found. Check OpenCL installation!\n";
+        exit(1);
+    }
+    cl::Platform default_platform=all_platforms[0];
+    std::cout << "Using platform: "<<default_platform.getInfo<CL_PLATFORM_NAME>()<<"\n";
+    
+    std::vector<cl::Device> all_devices;
+    default_platform.getDevices(CL_DEVICE_TYPE_GPU, &all_devices);
+    if(all_devices.size()==0){
+        std::cout<<" No devices found. Check OpenCL installation!\n";
+        exit(1);
+    }
+    cl::Device default_device=all_devices[0];
+    std::cout<< "Using device: "<<default_device.getInfo<CL_DEVICE_NAME>()<<"\n";
+    cl::Context context({default_device});
+    cl::Program::Sources sources;
+
+    // kernel calculates for each element C=A+B
+    std::string kernel_code=
+        "   void kernel frame_blend_kernel(global int* stride, global int* width, global int* height, global const int* src, global int* dest, global int* numSrcs, global int* srcpp, global const float* weightPercents){"   
+        "    for (int h = 0; h < *height; ++h) { "
+        "        for (int w = 0; w < *width; ++w) {"
+        "            float acc = 0;"
+        "            for (int i = 0; i < *numSrcs; ++i) {"
+        "                int val = srcpp[w*(*width) + i];"
+        "                acc += val * weightPercents[i];"
+        "            }"
+
+        "            dest[w] = acc;"
+        "        }"
+
+        "        for (int i = 0; i < *numSrcs; ++i) {"
+        "            srcpp[i] += stride;"
+        "        }"
+        "        *dest += *stride;"
+        "    }"
+        "}";
+    sources.push_back({kernel_code.c_str(),kernel_code.length()});
+
+    cl::Program program(context,sources);
+    if(program.build({default_device})!=CL_SUCCESS){
+        std::cout<<" Error building: "<<program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(default_device)<<"\n";
+        exit(1);
+    }
+
+    data.context = context;
+    data.sources = sources; 
+    data.program = program;
+    data.device = default_device;
+    
     out_data = new FrameBlendData { data };
 
     VSFilterDependency deps[] = {
@@ -192,7 +249,7 @@ static void VS_CC frameBlendCreate(const VSMap *in, VSMap *out, void *userData, 
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
     vspapi->configPlugin(
-        "com.vapoursynth.frameblender", "frameblender", "Frame blender", VS_MAKE_VERSION(1, 0), VAPOURSYNTH_API_VERSION,
+        "com.github.animafps.vs-frameblender-opencl", "frameblenderopencl", "Frame blender", VS_MAKE_VERSION(1, 0), VAPOURSYNTH_API_VERSION,
         0, plugin
     );
     vspapi->registerFunction(
