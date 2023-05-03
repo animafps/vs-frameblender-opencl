@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <fstream>
 #include <cstddef>
 #include <cstdlib>
 #include <limits>
@@ -28,14 +29,14 @@ frameBlend(const FrameBlendData *d, const VSFrame * const *srcs, VSFrame *dst, i
     int stride = vsapi->getStride(dst, plane) / sizeof(uint8_t);
     int width = vsapi->getFrameWidth(dst, plane);
     int height = vsapi->getFrameHeight(dst, plane);
+    int depth = d->vi->format.bytesPerSample;
 
     const uint8_t *srcpp[128];
-    const size_t numSrcs = d->weightPercents.size();
+    int numSrcs = d->weightPercents.size();
 
     for (size_t i = 0; i < numSrcs; i++) {
         srcpp[i] = reinterpret_cast<const uint8_t *>(vsapi->getReadPtr(srcs[i], plane));
     }
-    /// Need to linearize scrpp which is the array of frames 
 
     uint8_t *VS_RESTRICT dstp = reinterpret_cast<uint8_t *>(vsapi->getWritePtr(dst, plane));
     const float *weight = d->weightPercents.data();
@@ -43,22 +44,26 @@ frameBlend(const FrameBlendData *d, const VSFrame * const *srcs, VSFrame *dst, i
     cl::CommandQueue queue(d->context, d->device);
     cl::Kernel frame_blend_kernel = cl::Kernel(d->program, "frame_blend_kernel");
 
-    cl::Buffer strideBuf(d->context, CL_MEM_READ_ONLY | CL_MEM_HOST_NO_ACCESS | CL_MEM_COPY_HOST_PTR, sizeof(stride), &stride);
-    cl::Buffer widthBuf(d->context, CL_MEM_READ_ONLY | CL_MEM_HOST_NO_ACCESS | CL_MEM_COPY_HOST_PTR, sizeof(width), &width);
-    cl::Buffer heightBuf(d->context, CL_MEM_READ_ONLY | CL_MEM_HOST_NO_ACCESS | CL_MEM_COPY_HOST_PTR, sizeof(height), &height);
-    cl::Buffer destBuf(d->context, CL_MEM_COPY_HOST_PTR, sizeof(uint8_t) * width * height, &dst);
+    cl::Buffer strideBuf(d->context, CL_MEM_READ_ONLY | CL_MEM_HOST_NO_ACCESS | CL_MEM_COPY_HOST_PTR, sizeof(long), &stride);
+    cl::Buffer widthBuf(d->context, CL_MEM_READ_ONLY | CL_MEM_HOST_NO_ACCESS | CL_MEM_COPY_HOST_PTR, sizeof(unsigned), &width);
+    cl::Buffer heightBuf(d->context, CL_MEM_READ_ONLY | CL_MEM_HOST_NO_ACCESS | CL_MEM_COPY_HOST_PTR, sizeof(unsigned), &height);
+    cl::Buffer dstBuf(d->context, CL_MEM_COPY_HOST_PTR, sizeof(uint8_t) * width * height, &dst);
     cl::Buffer srcppBuf(d->context, CL_MEM_COPY_HOST_PTR, sizeof(uint8_t) * 128 * width * height, &srcpp);
-    cl::Buffer weightpercentsBuf(d->context, CL_MEM_COPY_HOST_PTR, sizeof(float) * numSrcs, &weight);
-    frame_blend_kernel.setArg(0, strideBuf);
-    frame_blend_kernel.setArg(1, widthBuf);
-    frame_blend_kernel.setArg(2,heightBuf);
-    frame_blend_kernel.setArg(3, destBuf);
-    frame_blend_kernel.setArg(4,srcppBuf);
-    frame_blend_kernel.setArg(5, weightpercentsBuf);
+    cl::Buffer weightsBuf(d->context, CL_MEM_COPY_HOST_PTR, sizeof(float) * numSrcs, &weight);
+    cl::Buffer numBuf(d->context, CL_MEM_COPY_HOST_PTR, sizeof(unsigned), &numSrcs);
+    cl::Buffer depthBuf(d->context, CL_MEM_COPY_HOST_PTR, sizeof(unsigned), &depth);
+    frame_blend_kernel.setArg(0, weightsBuf);
+    frame_blend_kernel.setArg(1, srcppBuf);
+    frame_blend_kernel.setArg(2, numBuf);
+    frame_blend_kernel.setArg(3, dstBuf);
+    frame_blend_kernel.setArg(4, depthBuf);
+    frame_blend_kernel.setArg(5, widthBuf);
+    frame_blend_kernel.setArg(6, heightBuf);
+    frame_blend_kernel.setArg(7, strideBuf);
     cl::Event ev1;
     queue.enqueueNDRangeKernel(frame_blend_kernel, cl::NullRange, cl::NDRange(numSrcs*width*height), cl::NullRange, NULL, &ev1);
     ev1.wait();
-    queue.enqueueReadBuffer(destBuf, true, 0,sizeof(uint8_t) * width * height, dst);
+    queue.enqueueReadBuffer(dstBuf, true, 0,sizeof(uint8_t) * width * height, dst);
 }
 
 static const VSFrame *VS_CC frameBlendGetFrame(
@@ -203,24 +208,24 @@ static void VS_CC frameBlendCreate(const VSMap *in, VSMap *out, void *userData, 
     cl::Context context({default_device});
     cl::Program::Sources sources;
 
-    // kernel calculates for each element C=A+B
     std::string kernel_code=
-        "   void kernel frame_blend_kernel(global int* stride, global int* width, global int* height, global const int* src, global int* dest, global int* numSrcs, global int* srcpp, global const float* weightPercents){"   
-        "    for (int h = 0; h < *height; ++h) { "
-        "        for (int w = 0; w < *width; ++w) {"
-        "            float acc = 0;"
-        "            for (int i = 0; i < *numSrcs; ++i) {"
-        "                int val = srcpp[w*(*width) + i];"
-        "                acc += val * weightPercents[i];"
+        "void kernel frame_blend_kernel(global const float *weights, global const void *srcs_, unsigned num_srcs, global void *dst_, unsigned depth, unsigned w, unsigned h, long stride){"        
+        "    ptrdiff_t offset = 0;"
+        "    int maxval = (1L << depth) - 1;"
+        "    unsigned** srcs = srcs_;"
+        "    for (unsigned i = 0; i < h; ++i) {"
+        "        int *dst = (dst_ + offset);"
+        "        for (unsigned j = 0; j < w; ++j) {"
+        "            int accum = 0;"
+        "            for (unsigned k = 0; k < num_srcs; ++k) {"
+        "                const unsigned *src = srcs[k] + offset;"
+        "                int val = src[j];"
+        "                accum += val * weights[k];"
         "            }"
-
-        "            dest[w] = acc;"
+        "            accum = min(max(accum, 0), maxval);"
+        "            dst[j] = accum;"
         "        }"
-
-        "        for (int i = 0; i < *numSrcs; ++i) {"
-        "            srcpp[i] += stride;"
-        "        }"
-        "        *dest += *stride;"
+        "        offset += stride;"
         "    }"
         "}";
     sources.push_back({kernel_code.c_str(),kernel_code.length()});

@@ -1,19 +1,24 @@
-void kernel frame_blend_kernel(global int* stride, global int* width, global int* height, global int* dest, global int* numSrcs, global int* srcpp, global const float* weightPercents){        
-    for (int h = 0; h < *height; ++h) {
-        for (int w = 0; w < *width; ++w) {
-            float acc = 0;
+void kernel frame_blend_kernel(global const float *weights, global const void *srcs_, unsigned num_srcs, global void *dst_, unsigned depth, unsigned w, unsigned h, long stride){        
+    ptrdiff_t offset = 0;
+	int maxval = (1L << depth) - 1;
+    unsigned** srcs = srcs_;
 
-            for (int i = 0; i < *numSrcs; ++i) {
-                int val = srcpp[w*(*width) + i]; //linearized frame
-                acc += val * weightPercents[i];
-            }
+	for (unsigned i = 0; i < h; ++i) {
+		int *dst = (dst_ + offset);
 
-            dest[w] = acc;
-        }
+		for (unsigned j = 0; j < w; ++j) {
+			int accum = 0;
 
-        for (int i = 0; i < *numSrcs; ++i) {
-            srcpp[i] += *stride; // might not work
-        }
-        *dest += *stride;
-    }
+			for (unsigned k = 0; k < num_srcs; ++k) {
+				const unsigned *src = srcs[k] + offset;
+				int val = src[j];
+				accum += val * weights[k];
+			}
+
+			accum = min(max(accum, 0), maxval);
+			dst[j] = accum;
+		}
+
+		offset += stride;
+	}
 }
