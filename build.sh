@@ -1,4 +1,4 @@
-clang src/blender.cpp  --shared -I./vapoursynth -I/usr/include -fPIC  -lOpenCL -lstdc++ -o ./blender.so
+clang src/blender.cpp --shared -fPIC -lOpenCL -lstdc++ -o ./blender.so
 
 if [ $? -eq 0 ]; then
     echo "Build success"
